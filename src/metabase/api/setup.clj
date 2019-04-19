@@ -5,20 +5,22 @@
              [email :as email]
              [events :as events]
              [public-settings :as public-settings]
-             [setup :as setup]
-             [util :as u]]
+             [setup :as setup]]
             [metabase.api
              [common :as api]
              [database :as database-api :refer [DBEngineString]]]
             [metabase.integrations.slack :as slack]
+            [metabase.middleware.session :as mw.session]
             [metabase.models
              [database :refer [Database]]
              [session :refer [Session]]
              [user :as user :refer [User]]]
-            [metabase.util.schema :as su]
-            [puppetlabs.i18n.core :as i18n :refer [tru]]
+            [metabase.util
+             [i18n :refer [tru]]
+             [schema :as su]]
             [schema.core :as s]
-            [toucan.db :as db]))
+            [toucan.db :as db])
+  (:import java.util.UUID))
 
 (def ^:private SetupToken
   "Schema for a string that matches the instance setup token."
@@ -32,7 +34,8 @@
   [:as {{:keys [token]
          {:keys [name engine details is_full_sync is_on_demand schedules]} :database
          {:keys [first_name last_name email password]}                     :user
-         {:keys [allow_tracking site_name]}                                :prefs} :body}]
+         {:keys [allow_tracking site_name]}                                :prefs} :body
+        :as request}]
   {token          SetupToken
    site_name      su/NonBlankString
    first_name     su/NonBlankString
@@ -42,22 +45,24 @@
    allow_tracking (s/maybe (s/cond-pre s/Bool su/BooleanString))
    schedules      (s/maybe database-api/ExpandedSchedulesMap)}
   ;; Now create the user
-  (let [session-id (str (java.util.UUID/randomUUID))
+  (let [session-id (UUID/randomUUID)
         new-user   (db/insert! User
                      :email        email
                      :first_name   first_name
                      :last_name    last_name
-                     :password     (str (java.util.UUID/randomUUID))
+                     :password     (str (UUID/randomUUID))
                      :is_superuser true)]
     ;; this results in a second db call, but it avoids redundant password code so figure it's worth it
     (user/set-password! (:id new-user) password)
     ;; set a couple preferences
     (public-settings/site-name site_name)
     (public-settings/admin-email email)
-    (public-settings/anon-tracking-enabled (or (nil? allow_tracking) ; default to `true` if allow_tracking isn't specified
-                                               allow_tracking))      ; the setting will set itself correctly whether a boolean or boolean string is specified
+    ;; default to `true` if allow_tracking isn't specified. The setting will set itself correctly whether a boolean or
+    ;; boolean string is specified
+    (public-settings/anon-tracking-enabled (or (nil? allow_tracking)
+                                               allow_tracking))
     ;; setup database (if needed)
-    (when (driver/is-engine? engine)
+    (when (some-> engine driver/available?)
       (let [db (db/insert! Database
                  (merge
                   {:name         name
@@ -73,35 +78,24 @@
     (setup/clear-token!)
     ;; then we create a session right away because we want our new user logged in to continue the setup process
     (db/insert! Session
-      :id      session-id
+      :id      (str session-id)
       :user_id (:id new-user))
     ;; notify that we've got a new user in the system AND that this user logged in
     (events/publish-event! :user-create {:user_id (:id new-user)})
-    (events/publish-event! :user-login {:user_id (:id new-user), :session_id session-id, :first_login true})
-    {:id session-id}))
+    (events/publish-event! :user-login {:user_id (:id new-user), :session_id (str session-id), :first_login true})
+    (mw.session/set-session-cookie request {:id (str session-id)} session-id)))
 
 
 (api/defendpoint POST "/validate"
   "Validate that we can connect to a database given a set of details."
-  [:as {{{:keys [engine] {:keys [host port] :as details} :details} :details, token :token} :body}]
+  [:as {{{:keys [engine details]} :details, token :token} :body}]
   {token  SetupToken
    engine DBEngineString}
   (let [engine           (keyword engine)
-        details          (assoc details :engine engine)
-        response-invalid (fn [field m] {:status 400 :body (if (= :general field)
-                                                            {:message m}
-                                                            {:errors {field m}})})]
-    ;; TODO - as @atte mentioned this should just use the same logic as we use in POST /api/database/, which tries with
-    ;; both SSL and non-SSL.
-    (try
-      (cond
-        (driver/can-connect-with-details? engine details :rethrow-exceptions) {:valid true}
-        (and host port (u/host-port-up? host port))                           (response-invalid :dbname  (format "Connection to '%s:%d' successful, but could not connect to DB." host port))
-        (and host (u/host-up? host))                                          (response-invalid :port    (format "Connection to '%s' successful, but port %d is invalid." port))
-        host                                                                  (response-invalid :host    (format "'%s' is not reachable" host))
-        :else                                                                 (response-invalid :general "Unable to connect to database."))
-      (catch Throwable e
-        (response-invalid :general (.getMessage e))))))
+        invalid-response (fn [field m] {:status 400, :body (if (#{:dbname :port :host} field)
+                                                             {:errors {field m}}
+                                                             {:message m})})]
+    (database-api/test-database-connection engine details :invalid-response-handler invalid-response)))
 
 
 ;;; Admin Checklist
@@ -152,7 +146,7 @@
      {:title       (tru "Organize questions")
       :group       (tru "Curate your data")
       :description (tru "Have a lot of saved questions in {0}? Create collections to help manage them and add context." (tru "Metabase"))
-      :link        "/questions/"
+      :link        "/collection/root"
       :completed   has-collections?
       :triggered   (>= num-cards 30)}
      {:title       (tru "Create metrics")

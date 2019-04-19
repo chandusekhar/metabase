@@ -1,13 +1,11 @@
 (ns metabase.query-processor.middleware.permissions-test
   "Tests for the middleware that checks whether the current user has permissions to run a given query."
   (:require [expectations :refer :all]
-            [metabase.api.common :as api]
             [metabase.models
              [database :refer [Database]]
              [permissions :as perms]
              [permissions-group :as perms-group]
-             [table :refer [Table]]
-             [user :as user]]
+             [table :refer [Table]]]
             [metabase.query-processor.middleware.permissions :refer [check-query-permissions]]
             [metabase.test.data.users :as users]
             [metabase.util :as u]
@@ -18,9 +16,7 @@
 (defn- do-with-rasta
   "Call F with rasta as the current user."
   [f]
-  (binding [api/*current-user-id*              (users/user->id :rasta)
-            api/*current-user-permissions-set* (atom (user/permissions-set (users/user->id :rasta)))]
-    (f)))
+  (users/do-with-test-user :rasta f))
 
 (defn- check-perms-for-rasta
   "Check permissions for QUERY with rasta as the current user."
@@ -28,7 +24,8 @@
   [query]
   (do-with-rasta (fn [] (check-perms query))))
 
-;;; ------------------------------------------------------------ Native Queries ------------------------------------------------------------
+
+;;; ------------------------------------------------- Native Queries -------------------------------------------------
 
 ;; Make sure the NATIVE query fails to run if current user doesn't have perms
 (expect
@@ -50,7 +47,7 @@
      :native   {:query "SELECT * FROM VENUES"}}))
 
 
-;;; ------------------------------------------------------------ MBQL Queries ------------------------------------------------------------
+;;; -------------------------------------------------- MBQL Queries --------------------------------------------------
 
 (expect
   Exception
@@ -67,14 +64,14 @@
   ;; query should be returned by middleware unchanged
   {:database (u/get-id db)
    :type     :query
-   :query    {:source-table {:name "Toucans", :id (u/get-id table)}}}
+   :query    {:source-table (u/get-id table)}}
   (check-perms-for-rasta
     {:database (u/get-id db)
      :type     :query
-     :query    {:source-table {:name "Toucans", :id (u/get-id table)}}}))
+     :query    {:source-table (u/get-id table)}}))
 
 
-;;; ------------------------------------------------------------ Nested Native Queries ------------------------------------------------------------
+;;; --------------------------------------------- Nested Native Queries ----------------------------------------------
 
 (expect
   Exception
@@ -94,7 +91,7 @@
      :query   {:source-query {:native "SELECT * FROM VENUES"}}}))
 
 
-;;; ------------------------------------------------------------ Nested MBQL Queries ------------------------------------------------------------
+;;; ---------------------------------------------- Nested MBQL Queries -----------------------------------------------
 
 ;; For nested queries MBQL make sure perms are checked
 (expect
@@ -111,8 +108,8 @@
                       Table    [table {:db_id (u/get-id db)}]]
   {:database (u/get-id db)
    :type     :query
-   :query    {:source-query {:source-table {:name "Toucans", :id (u/get-id table)}}}}
+   :query    {:source-query {:source-table (u/get-id table)}}}
   (check-perms-for-rasta
     {:database (u/get-id db)
      :type     :query
-     :query    {:source-query {:source-table {:name "Toucans", :id (u/get-id table)}}}}))
+     :query    {:source-query {:source-table (u/get-id table)}}}))

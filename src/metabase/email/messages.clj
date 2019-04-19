@@ -12,14 +12,18 @@
              [util :as u]]
             [metabase.pulse.render :as render]
             [metabase.util
+             [date :as du]
+             [export :as export]
+             [i18n :refer [trs tru]]
              [quotation :as quotation]
              [urls :as url]]
             [stencil
              [core :as stencil]
              [loader :as stencil-loader]]
             [toucan.db :as db])
-  (:import [java.io File FileOutputStream]
-           java.util.Arrays))
+  (:import [java.io File IOException]))
+
+(alter-meta! #'stencil.core/render-file assoc :style/indent 1)
 
 ;; Dev only -- disable template caching
 (when config/is-dev?
@@ -33,19 +37,21 @@
     {:quotation       (:quote data-quote)
      :quotationAuthor (:author data-quote)}))
 
-(def ^:private ^:const notification-context
+(def ^:private notification-context
   {:emailType  "notification"
    :logoHeader true})
 
-(def ^:private ^:const abandonment-context
-  {:heading      "We’d love your feedback."
-   :callToAction "It looks like Metabase wasn’t quite a match for you. Would you mind taking a fast 5 question survey to help the Metabase team understand why and make things better in the future?"
-   :link         "http://www.metabase.com/feedback/inactive"})
+(defn- abandonment-context []
+  {:heading      (str (trs "We’d love your feedback."))
+   :callToAction (str (trs "It looks like Metabase wasn’t quite a match for you.")
+                      " "
+                      (trs "Would you mind taking a fast 5 question survey to help the Metabase team understand why and make things better in the future?"))
+   :link         "https://metabase.com/feedback/inactive"})
 
-(def ^:private ^:const follow-up-context
-  {:heading      "We hope you've been enjoying Metabase."
-   :callToAction "Would you mind taking a fast 6 question survey to tell us how it’s going?"
-   :link         "http://www.metabase.com/feedback/active"})
+(defn- follow-up-context []
+  {:heading      (str (trs "We hope you''ve been enjoying Metabase."))
+   :callToAction (str (trs "Would you mind taking a fast 6 question survey to tell us how it’s going?"))
+   :link         "https://metabase.com/feedback/active"})
 
 
 ;;; ### Public Interface
@@ -61,7 +67,7 @@
                                :invitorEmail (:email invitor)
                                :company      company
                                :joinUrl      join-url
-                               :today        (u/format-date "MMM'&nbsp;'dd,'&nbsp;'yyyy")
+                               :today        (du/format-date "MMM'&nbsp;'dd,'&nbsp;'yyyy")
                                :logoHeader   true}
                               (random-quote-context)))]
     (email/send-message!
@@ -72,8 +78,9 @@
 
 (defn- all-admin-recipients
   "Return a sequence of email addresses for all Admin users.
-   The first recipient will be the site admin (or oldest admin if unset), which is the address that should be used in `mailto` links
-   (e.g., for the new user to email with any questions)."
+
+  The first recipient will be the site admin (or oldest admin if unset), which is the address that should be used in
+  `mailto` links (e.g., for the new user to email with any questions)."
   []
   (concat (when-let [admin-email (public-settings/admin-email)]
             [admin-email])
@@ -85,10 +92,9 @@
   {:pre [(map? new-user)]}
   (let [recipients (all-admin-recipients)]
     (email/send-message!
-      :subject      (format (if google-auth?
-                              "%s created a Metabase account"
-                              "%s accepted their Metabase invite")
-                            (:common_name new-user))
+      :subject      (str (if google-auth?
+                           (trs "{0} created a Metabase account"     (:common_name new-user))
+                           (trs "{0} accepted their Metabase invite" (:common_name new-user))))
       :recipients   recipients
       :message-type :html
       :message      (stencil/render-file "metabase/email/user_joined_notification"
@@ -96,7 +102,7 @@
                               :joinedUserName    (:first_name new-user)
                               :joinedViaSSO      google-auth?
                               :joinedUserEmail   (:email new-user)
-                              :joinedDate        (u/format-date "EEEE, MMMM d") ; e.g. "Wednesday, July 13". TODO - is this what we want?
+                              :joinedDate        (du/format-date "EEEE, MMMM d") ; e.g. "Wednesday, July 13". TODO - is this what we want?
                               :adminEmail        (first recipients)
                               :joinedUserEditUrl (str (public-settings/site-url) "/admin/people")}
                              (random-quote-context))))))
@@ -106,7 +112,7 @@
   "Format and send an email informing the user how to reset their password."
   [email google-auth? hostname password-reset-url]
   {:pre [(m/boolean? google-auth?)
-         (u/is-email? email)
+         (u/email? email)
          (string? hostname)
          (string? password-reset-url)]}
   (let [message-body (stencil/render-file "metabase/email/password_reset"
@@ -116,12 +122,13 @@
                         :passwordResetUrl password-reset-url
                         :logoHeader       true})]
     (email/send-message!
-      :subject      "[Metabase] Password Reset Request"
+      :subject      (str (trs "[Metabase] Password Reset Request"))
       :recipients   [email]
       :message-type :html
       :message      message-body)))
 
-;; TODO - I didn't write these function and I don't know what it's for / what it's supposed to be doing. If this is determined add appropriate documentation
+;; TODO - I didn't write these function and I don't know what it's for / what it's supposed to be doing. If this is
+;; determined add appropriate documentation
 
 (defn- model-name->url-fn [model]
   (case model
@@ -148,13 +155,13 @@
 (defn send-notification-email!
   "Format and send an email informing the user about changes to objects in the system."
   [email context]
-  {:pre [(u/is-email? email) (map? context)]}
+  {:pre [(u/email? email) (map? context)]}
   (let [context      (merge (update context :dependencies build-dependencies)
                             notification-context
                             (random-quote-context))
         message-body (stencil/render-file "metabase/email/notification" context)]
     (email/send-message!
-      :subject      "[Metabase] Notification"
+      :subject      (str (trs "[Metabase] Notification"))
       :recipients   [email]
       :message-type :html
       :message      message-body)))
@@ -162,15 +169,15 @@
 (defn send-follow-up-email!
   "Format and send an email to the system admin following up on the installation."
   [email msg-type]
-  {:pre [(u/is-email? email) (contains? #{"abandon" "follow-up"} msg-type)]}
-  (let [subject      (if (= "abandon" msg-type)
-                       "[Metabase] Help make Metabase better."
-                       "[Metabase] Tell us how things are going.")
+  {:pre [(u/email? email) (contains? #{"abandon" "follow-up"} msg-type)]}
+  (let [subject      (str (if (= "abandon" msg-type)
+                            (trs "[Metabase] Help make Metabase better.")
+                            (trs "[Metabase] Tell us how things are going.")))
         context      (merge notification-context
                             (random-quote-context)
                             (if (= "abandon" msg-type)
-                              abandonment-context
-                              follow-up-context))
+                              (abandonment-context)
+                              (follow-up-context)))
         message-body (stencil/render-file "metabase/email/follow_up_email" context)]
     (email/send-message!
       :subject      subject
@@ -187,10 +194,50 @@
 (defn- pulse-context [pulse]
   (merge {:emailType    "pulse"
           :pulseName    (:name pulse)
-          :sectionStyle render/section-style
+          :sectionStyle (render/style (render/section-style))
           :colorGrey4   render/color-gray-4
           :logoFooter   true}
          (random-quote-context)))
+
+(defn- create-temp-file
+  "Separate from `create-temp-file-or-throw` primarily so that we can simulate exceptions in tests"
+  [suffix]
+  (doto (File/createTempFile "metabase_attachment" suffix)
+    .deleteOnExit))
+
+(defn- create-temp-file-or-throw
+  "Tries to create a temp file, will give the users a better error message if we are unable to create the temp file"
+  [suffix]
+  (try
+    (create-temp-file suffix)
+    (catch IOException e
+      (let [ex-msg (str (tru "Unable to create temp file in `{0}` for email attachments "
+                             (System/getProperty "java.io.tmpdir")))]
+        (throw (IOException. ex-msg e))))))
+
+(defn- create-result-attachment-map [export-type card-name ^File attachment-file]
+  (let [{:keys [content-type ext]} (get export/export-formats export-type)]
+    {:type         :attachment
+     :content-type content-type
+     :file-name    (format "%s.%s" card-name ext)
+     :content      (-> attachment-file .toURI .toURL)
+     :description  (format "More results for '%s'" card-name)}))
+
+(defn- result-attachments [results]
+  (remove nil?
+          (apply concat
+                 (for [{{card-name :name, :as card} :card :as result} results
+                       :let [{:keys [rows] :as result-data} (get-in result [:result :data])]
+                       :when (seq rows)]
+                   [(when-let [temp-file (and (render/include-csv-attachment? card result-data)
+                                              (create-temp-file-or-throw "csv"))]
+                      (export/export-to-csv-writer temp-file result)
+                      (create-result-attachment-map "csv" card-name temp-file))
+
+                    (when-let [temp-file (and (:include_xls card)
+                                              (create-temp-file-or-throw "xlsx"))]
+                      (export/export-to-xlsx-file temp-file result)
+                      (create-result-attachment-map "xlsx" card-name temp-file))]))))
 
 (defn- render-message-body [message-template message-context timezone results]
   (let [rendered-cards (binding [render/*include-title* true]
@@ -198,13 +245,19 @@
                          (doall (map #(render/render-pulse-section timezone %) results)))
         message-body   (assoc message-context :pulse (html (vec (cons :div (map :content rendered-cards)))))
         attachments    (apply merge (map :attachments rendered-cards))]
-    (vec (cons {:type "text/html; charset=utf-8" :content (stencil/render-file message-template message-body)}
-               (map make-message-attachment attachments)))))
+    (vec (concat [{:type "text/html; charset=utf-8" :content (stencil/render-file message-template message-body)}]
+                 (map make-message-attachment attachments)
+                 (result-attachments results)))))
+
+(defn- assoc-attachment-booleans [pulse results]
+  (for [{{result-card-id :id} :card :as result} results
+        :let [pulse-card (m/find-first #(= (:id %) result-card-id) (:cards pulse))]]
+    (update result :card merge (select-keys pulse-card [:include_csv :include_xls]))))
 
 (defn render-pulse-email
   "Take a pulse object and list of results, returns an array of attachment objects for an email"
   [timezone pulse results]
-  (render-message-body "metabase/email/pulse" (pulse-context pulse) timezone results))
+  (render-message-body "metabase/email/pulse" (pulse-context pulse) timezone (assoc-attachment-booleans pulse results)))
 
 (defn pulse->alert-condition-kwd
   "Given an `ALERT` return a keyword representing what kind of goal needs to be met."
@@ -230,7 +283,7 @@
      (merge {:questionURL (url/card-url card-id)
              :questionName card-name
              :emailType    "alert"
-             :sectionStyle render/section-style
+             :sectionStyle (render/section-style)
              :colorGrey4   render/color-gray-4
              :logoFooter   true}
             (random-quote-context)
@@ -248,7 +301,8 @@
   (let [message-ctx  (default-alert-context alert (alert-results-condition-text goal-value))]
     (render-message-body "metabase/email/alert"
                          (assoc message-ctx :firstRunOnly? alert_first_only)
-                         timezone results)))
+                         timezone
+                         (assoc-attachment-booleans alert results))))
 
 (def ^:private alert-condition-text
   {:meets "when this question meets its goal"
@@ -282,7 +336,7 @@
 (defn send-new-alert-email!
   "Send out the initial 'new alert' email to the `CREATOR` of the alert"
   [{:keys [creator] :as alert}]
-  (send-email! creator "You setup an alert" new-alert-template
+  (send-email! creator "You set up an alert" new-alert-template
                (default-alert-context alert alert-condition-text)))
 
 (defn send-you-unsubscribed-alert-email!

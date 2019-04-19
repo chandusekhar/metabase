@@ -1,307 +1,54 @@
 (ns metabase.util
   "Common utility functions useful throughout the codebase."
-  (:require [clj-time
-             [coerce :as coerce]
-             [core :as t]
-             [format :as time]]
-            [clojure
+  (:require [clojure
              [data :as data]
              [pprint :refer [pprint]]
-             [string :as s]]
-            [clojure.java
-             [classpath :as classpath]
-             [jdbc :as jdbc]]
+             [string :as s]
+             [walk :as walk]]
+            [clojure.java.classpath :as classpath]
             [clojure.math.numeric-tower :as math]
             [clojure.tools.logging :as log]
             [clojure.tools.namespace.find :as ns-find]
-            colorize.core ; this needs to be loaded for `format-color`
+            [colorize.core :as colorize]
+            [medley.core :as m]
             [metabase.config :as config]
-            [puppetlabs.i18n.core :as i18n :refer [trs]]
+            [metabase.util.i18n :refer [trs tru]]
             [ring.util.codec :as codec])
-  (:import clojure.lang.Keyword
-           [java.net InetAddress InetSocketAddress Socket]
-           [java.sql SQLException Timestamp]
+  (:import [java.net InetAddress InetSocketAddress Socket]
            [java.text Normalizer Normalizer$Form]
-           [java.util Calendar Date TimeZone]
-           javax.xml.bind.DatatypeConverter
-           org.joda.time.DateTime
-           org.joda.time.format.DateTimeFormatter))
+           java.util.concurrent.TimeoutException
+           java.util.Locale))
 
-;; This is the very first log message that will get printed.  It's here because this is one of the very first
-;; namespaces that gets loaded, and the first that has access to the logger It shows up a solid 10-15 seconds before
-;; the "Starting Metabase in STANDALONE mode" message because so many other namespaces need to get loaded
-(log/info (trs "Loading Metabase..."))
+;; This is the very first log message that will get printed.
+;; It's here because this is one of the very first namespaces that gets loaded, and the first that has access to the logger
+;; It shows up a solid 10-15 seconds before the "Starting Metabase in STANDALONE mode" message because so many other namespaces need to get loaded
+(when-not *compile-files*
+  (log/info (trs "Loading Metabase...")))
+
+(defn format-bytes
+  "Nicely format `num-bytes` as kilobytes/megabytes/etc.
+
+    (format-bytes 1024) ; -> 2.0 KB"
+  [num-bytes]
+  (loop [n num-bytes [suffix & more] ["B" "KB" "MB" "GB"]]
+    (if (and (seq more)
+             (>= n 1024))
+      (recur (/ n 1024.0) more)
+      (format "%.1f %s" n suffix))))
+
+;; Log the maximum memory available to the JVM at launch time as well since it is very handy for debugging things
+(when-not *compile-files*
+  (log/info (trs "Maximum memory available to JVM: {0}" (format-bytes (.maxMemory (Runtime/getRuntime))))))
 
 ;; Set the default width for pprinting to 200 instead of 72. The default width is too narrow and wastes a lot of space
 ;; for pprinting huge things like expanded queries
 (intern 'clojure.pprint '*print-right-margin* 200)
-
-(declare pprint-to-str)
 
 (defmacro ignore-exceptions
   "Simple macro which wraps the given expression in a try/catch block and ignores the exception if caught."
   {:style/indent 0}
   [& body]
   `(try ~@body (catch Throwable ~'_)))
-
-;;; ### Protocols
-
-(defprotocol ITimestampCoercible
-  "Coerce object to a `java.sql.Timestamp`."
-  (->Timestamp ^java.sql.Timestamp [this]
-    "Coerce this object to a `java.sql.Timestamp`.
-     Strings are parsed as ISO-8601."))
-
-(extend-protocol ITimestampCoercible
-  nil       (->Timestamp [_]
-              nil)
-  Timestamp (->Timestamp [this]
-              this)
-  Date       (->Timestamp [this]
-               (Timestamp. (.getTime this)))
-  ;; Number is assumed to be a UNIX timezone in milliseconds (UTC)
-  Number    (->Timestamp [this]
-              (Timestamp. this))
-  Calendar  (->Timestamp [this]
-              (->Timestamp (.getTime this)))
-  ;; Strings are expected to be in ISO-8601 format. `YYYY-MM-DD` strings *are* valid ISO-8601 dates.
-  String    (->Timestamp [this]
-              (->Timestamp (DatatypeConverter/parseDateTime this)))
-  DateTime  (->Timestamp [this]
-              (->Timestamp (.getMillis this))))
-
-
-(defprotocol IDateTimeFormatterCoercible
-  "Protocol for converting objects to `DateTimeFormatters`."
-  (->DateTimeFormatter ^org.joda.time.format.DateTimeFormatter [this]
-    "Coerce object to a `DateTimeFormatter`."))
-
-(extend-protocol IDateTimeFormatterCoercible
-  ;; Specify a format string like "yyyy-MM-dd"
-  String            (->DateTimeFormatter [this] (time/formatter this))
-  DateTimeFormatter (->DateTimeFormatter [this] this)
-  ;; Keyword will be used to get matching formatter from time/formatters
-  Keyword           (->DateTimeFormatter [this] (or (time/formatters this)
-                                                    (throw (Exception. (format "Invalid formatter name, must be one of:\n%s"
-                                                                               (pprint-to-str (sort (keys time/formatters)))))))))
-
-(defn parse-date
-  "Parse a datetime string S with a custom DATE-FORMAT, which can be a format string,
-   clj-time formatter keyword, or anything else that can be coerced to a `DateTimeFormatter`.
-
-     (parse-date \"yyyyMMdd\" \"20160201\") -> #inst \"2016-02-01\"
-     (parse-date :date-time \"2016-02-01T00:00:00.000Z\") -> #inst \"2016-02-01\""
-  ^java.sql.Timestamp [date-format, ^String s]
-  (->Timestamp (time/parse (->DateTimeFormatter date-format) s)))
-
-
-(defprotocol ISO8601
-  "Protocol for converting objects to ISO8601 formatted strings."
-  (->iso-8601-datetime ^String [this timezone-id]
-    "Coerce object to an ISO8601 date-time string such as \"2015-11-18T23:55:03.841Z\" with a given TIMEZONE."))
-
-(def ^:private ISO8601Formatter
-  ;; memoize this because the formatters are static. They must be distinct per timezone though.
-  (memoize (fn [timezone-id]
-             (if timezone-id
-               (time/with-zone (time/formatters :date-time) (t/time-zone-for-id timezone-id))
-               (time/formatters :date-time)))))
-
-(extend-protocol ISO8601
-  nil                    (->iso-8601-datetime [_ _] nil)
-  java.util.Date         (->iso-8601-datetime [this timezone-id] (time/unparse (ISO8601Formatter timezone-id) (coerce/from-date this)))
-  java.sql.Date          (->iso-8601-datetime [this timezone-id] (time/unparse (ISO8601Formatter timezone-id) (coerce/from-sql-date this)))
-  java.sql.Timestamp     (->iso-8601-datetime [this timezone-id] (time/unparse (ISO8601Formatter timezone-id) (coerce/from-sql-time this)))
-  org.joda.time.DateTime (->iso-8601-datetime [this timezone-id] (time/unparse (ISO8601Formatter timezone-id) this)))
-
-
-;;; ## Date Stuff
-
-(defn is-temporal?
-  "Is VALUE an instance of a datetime class like `java.util.Date` or `org.joda.time.DateTime`?"
-  [v]
-  (or (instance? java.util.Date v)
-      (instance? org.joda.time.DateTime v)))
-
-(defn new-sql-timestamp
-  "`java.sql.Date` doesn't have an empty constructor so this is a convenience that lets you make one with the current date.
-   (Some DBs like Postgres will get snippy if you don't use a `java.sql.Timestamp`)."
-  ^java.sql.Timestamp []
-  (->Timestamp (System/currentTimeMillis)))
-
-(defn format-date
-  "Format DATE using a given DATE-FORMAT.
-
-   DATE is anything that can coerced to a `Timestamp` via `->Timestamp`, such as a `Date`, `Timestamp`,
-   `Long` (ms since the epoch), or an ISO-8601 `String`. DATE defaults to the current moment in time.
-
-   DATE-FORMAT is anything that can be passed to `->DateTimeFormatter`, such as `String`
-   (using [the usual date format args](http://docs.oracle.com/javase/7/docs/api/java/text/SimpleDateFormat.html)),
-   `Keyword`, or `DateTimeFormatter`.
-
-
-     (format-date \"yyyy-MM-dd\")                        -> \"2015-11-18\"
-     (format-date :year (java.util.Date.))               -> \"2015\"
-     (format-date :date-time (System/currentTimeMillis)) -> \"2015-11-18T23:55:03.841Z\""
-  (^String [date-format]
-   (format-date date-format (System/currentTimeMillis)))
-  (^String [date-format date]
-   (time/unparse (->DateTimeFormatter date-format) (coerce/from-sql-time (->Timestamp date)))))
-
-(def ^{:arglists '([] [date])} date->iso-8601
-  "Format DATE a an ISO-8601 string."
-  (partial format-date :date-time))
-
-(defn date-string?
-  "Is S a valid ISO 8601 date string?"
-  [^String s]
-  (boolean (when (string? s)
-             (ignore-exceptions
-               (->Timestamp s)))))
-
-
-(defn ->Date
-  "Coerece DATE to a `java.util.Date`."
-  (^java.util.Date []
-   (java.util.Date.))
-  (^java.util.Date [date]
-   (java.util.Date. (.getTime (->Timestamp date)))))
-
-
-(defn ->Calendar
-  "Coerce DATE to a `java.util.Calendar`."
-  (^java.util.Calendar []
-   (doto (Calendar/getInstance)
-     (.setTimeZone (TimeZone/getTimeZone "UTC"))))
-  (^java.util.Calendar [date]
-   (doto (->Calendar)
-     (.setTime (->Timestamp date))))
-  (^java.util.Calendar [date, ^String timezone-id]
-   (doto (->Calendar date)
-     (.setTimeZone (TimeZone/getTimeZone timezone-id)))))
-
-
-(defn relative-date
-  "Return a new `Timestamp` relative to the current time using a relative date UNIT.
-
-     (relative-date :year -1) -> #inst 2014-11-12 ..."
-  (^java.sql.Timestamp [unit amount]
-   (relative-date unit amount (Calendar/getInstance)))
-  (^java.sql.Timestamp [unit amount date]
-   (let [cal               (->Calendar date)
-         [unit multiplier] (case unit
-                             :second  [Calendar/SECOND 1]
-                             :minute  [Calendar/MINUTE 1]
-                             :hour    [Calendar/HOUR   1]
-                             :day     [Calendar/DATE   1]
-                             :week    [Calendar/DATE   7]
-                             :month   [Calendar/MONTH  1]
-                             :quarter [Calendar/MONTH  3]
-                             :year    [Calendar/YEAR   1])]
-     (.set cal unit (+ (.get cal unit)
-                       (* amount multiplier)))
-     (->Timestamp cal))))
-
-
-(def ^:private ^:const date-extract-units
-  #{:minute-of-hour :hour-of-day :day-of-week :day-of-month :day-of-year :week-of-year :month-of-year :quarter-of-year :year})
-
-(defn date-extract
-  "Extract UNIT from DATE. DATE defaults to now.
-
-     (date-extract :year) -> 2015"
-  ([unit]
-   (date-extract unit (System/currentTimeMillis) "UTC"))
-  ([unit date]
-   (date-extract unit date "UTC"))
-  ([unit date timezone-id]
-   (let [cal (->Calendar date timezone-id)]
-     (case unit
-       :minute-of-hour  (.get cal Calendar/MINUTE)
-       :hour-of-day     (.get cal Calendar/HOUR_OF_DAY)
-       ;; 1 = Sunday <-> 6 = Saturday
-       :day-of-week     (.get cal Calendar/DAY_OF_WEEK)
-       :day-of-month    (.get cal Calendar/DAY_OF_MONTH)
-       :day-of-year     (.get cal Calendar/DAY_OF_YEAR)
-       ;; 1 = First week of year
-       :week-of-year    (.get cal Calendar/WEEK_OF_YEAR)
-       :month-of-year   (inc (.get cal Calendar/MONTH))
-       :quarter-of-year (let [month (date-extract :month-of-year date timezone-id)]
-                          (int (/ (+ 2 month)
-                                  3)))
-       :year            (.get cal Calendar/YEAR)))))
-
-
-(def ^:private ^:const date-trunc-units
-  #{:minute :hour :day :week :month :quarter :year})
-
-(defn- trunc-with-format [format-string date timezone-id]
-  (->Timestamp (format-date (time/with-zone (time/formatter format-string)
-                              (t/time-zone-for-id timezone-id))
-                            date)))
-
-(defn- trunc-with-floor [date amount-ms]
-  (->Timestamp (* (math/floor (/ (.getTime (->Timestamp date))
-                                 amount-ms))
-                  amount-ms)))
-
-(defn- ->first-day-of-week [date timezone-id]
-  (let [day-of-week (date-extract :day-of-week date timezone-id)]
-    (relative-date :day (- (dec day-of-week)) date)))
-
-(defn- format-string-for-quarter ^String [date timezone-id]
-  (let [year    (date-extract :year date timezone-id)
-        quarter (date-extract :quarter-of-year date timezone-id)
-        month   (- (* 3 quarter) 2)]
-    (format "%d-%02d-01ZZ" year month)))
-
-(defn date-trunc
-  "Truncate DATE to UNIT. DATE defaults to now.
-
-     (date-trunc :month).
-     ;; -> #inst \"2015-11-01T00:00:00\""
-  (^java.sql.Timestamp [unit]
-   (date-trunc unit (System/currentTimeMillis) "UTC"))
-  (^java.sql.Timestamp [unit date]
-   (date-trunc unit date "UTC"))
-  (^java.sql.Timestamp [unit date timezone-id]
-   (case unit
-     ;; For minute and hour truncation timezone should not be taken into account
-     :minute  (trunc-with-floor date (* 60 1000))
-     :hour    (trunc-with-floor date (* 60 60 1000))
-     :day     (trunc-with-format "yyyy-MM-ddZZ" date timezone-id)
-     :week    (trunc-with-format "yyyy-MM-ddZZ" (->first-day-of-week date timezone-id) timezone-id)
-     :month   (trunc-with-format "yyyy-MM-01ZZ" date timezone-id)
-     :quarter (trunc-with-format (format-string-for-quarter date timezone-id) date timezone-id)
-     :year    (trunc-with-format "yyyy-01-01ZZ" date timezone-id))))
-
-
-(defn date-trunc-or-extract
-  "Apply date bucketing with UNIT to DATE. DATE defaults to now."
-  ([unit]
-   (date-trunc-or-extract unit (System/currentTimeMillis) "UTC"))
-  ([unit date]
-   (date-trunc-or-extract unit date "UTC"))
-  ([unit date timezone-id]
-   (cond
-     (= unit :default) date
-
-     (contains? date-extract-units unit)
-     (date-extract unit date timezone-id)
-
-     (contains? date-trunc-units unit)
-     (date-trunc unit date timezone-id))))
-
-(defn format-nanoseconds
-  "Format a time interval in nanoseconds to something more readable (µs/ms/etc.)
-   Useful for logging elapsed time when using `(System/nanotime)`"
-  ^String [nanoseconds]
-  (loop [n nanoseconds, [[unit divisor] & more] [[:ns 1000] [:µs 1000] [:ms 1000] [:s 60] [:mins 60] [:hours Integer/MAX_VALUE]]]
-    (if (and (> n divisor)
-             (seq more))
-      (recur (/ n divisor) more)
-      (format "%.0f %s" (double n) (name unit)))))
-
 
 ;;; ## Etc
 
@@ -339,9 +86,8 @@
 
 
 (defn optional
-  "Helper function for defining functions that accept optional arguments.
-   If PRED? is true of the first item in ARGS, a pair like `[first-arg other-args]`
-   is returned; otherwise, a pair like `[DEFAULT other-args]` is returned.
+  "Helper function for defining functions that accept optional arguments. If PRED? is true of the first item in ARGS,
+  a pair like `[first-arg other-args]` is returned; otherwise, a pair like `[DEFAULT other-args]` is returned.
 
    If DEFAULT is not specified, `nil` will be returned when PRED? is false.
 
@@ -359,16 +105,15 @@
       [default args]))
 
 
-;; TODO - rename to `email?`
-(defn is-email?
+(defn email?
   "Is STRING a valid email address?"
   ^Boolean [^String s]
   (boolean (when (string? s)
              (re-matches #"[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*@(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
                          (s/lower-case s)))))
 
-;; TODO - rename to `url?`
-(defn is-url?
+
+(defn url?
   "Is STRING a valid HTTP/HTTPS URL? (This only handles `localhost` and domains like `metabase.com`; URLs containing
   IP addresses will return `false`.)"
   ^Boolean [^String s]
@@ -455,17 +200,6 @@
                   ~@body)
                 ~collection)))
 
-(defn first-index-satisfying
-  "Return the index of the first item in COLL where `(pred item)` is logically `true`.
-
-     (first-index-satisfying keyword? ['a 'b :c 3 \"e\"]) -> 2"
-  {:style/indent 1}
-  [pred coll]
-  (loop [i 0, [item & more] coll]
-    (cond
-      (pred item) i
-      (seq more)  (recur (inc i) more))))
-
 (defmacro prog1
   "Execute FIRST-FORM, then any other expressions in BODY, presumably for side-effects; return the result of
    FIRST-FORM.
@@ -498,39 +232,38 @@
      ~'<>))
 
 (def ^String ^{:arglists '([emoji-string])} emoji
-  "Returns the EMOJI-STRING passed in if emoji in logs are enabled, otherwise always returns an empty string."
+  "Returns the `emoji-string` passed in if emoji in logs are enabled, otherwise always returns an empty string."
   (if (config/config-bool :mb-emoji-in-logs)
     identity
     (constantly "")))
 
 (def ^:private ^{:arglists '([color-symb x])} colorize
-  "Colorize string X with the function matching COLOR-SYMB, but only if `MB_COLORIZE_LOGS` is enabled (the default)."
+  "Colorize string `x` with the function matching `color` symbol or keyword, but only if `MB_COLORIZE_LOGS` is
+  enabled (the default)."
   (if (config/config-bool :mb-colorize-logs)
-    (fn [color-symb x]
-      (let [color-fn (or (ns-resolve 'colorize.core color-symb)
-                         (throw (Exception. (str "Invalid color symbol: " color-symb))))]
-        (color-fn x)))
+    (fn [color x]
+      (colorize/color (keyword color) x))
     (fn [_ x]
       x)))
 
 (defn format-color
-  "Like `format`, but uses a function in `colorize.core` to colorize the output.
-   COLOR-SYMB should be a quoted symbol like `green`, `red`, `yellow`, `blue`,
-   `cyan`, `magenta`, etc. See the entire list of avaliable colors
-   [here](https://github.com/ibdknox/colorize/blob/master/src/colorize/core.clj).
+  "Like `format`, but colorizes the output. `color` should be a symbol or keyword like `green`, `red`, `yellow`, `blue`,
+  `cyan`, `magenta`, etc. See the entire list of avaliable
+  colors [here](https://github.com/ibdknox/colorize/blob/master/src/colorize/core.clj).
 
-     (format-color 'red \"Fatal error: %s\" error-message)"
+     (format-color :red \"Fatal error: %s\" error-message)"
   {:style/indent 2}
-  (^String [color-symb x]
-   {:pre [(symbol? color-symb)]}
-   (colorize color-symb x))
-  (^String [color-symb format-string & args]
-   (colorize color-symb (apply format format-string args))))
+  (^String [color x]
+   {:pre [((some-fn symbol? keyword?) color)]}
+   (colorize color (str x)))
+
+  (^String [color format-string & args]
+   (colorize color (apply format (str format-string) args))))
 
 (defn pprint-to-str
-  "Returns the output of pretty-printing X as a string.
-   Optionally accepts COLOR-SYMB, which colorizes the output with the corresponding
-   function from `colorize.core`.
+  "Returns the output of pretty-printing `x` as a string.
+  Optionally accepts `color-symb`, which colorizes the output with the corresponding
+  function from `colorize.core`.
 
      (pprint-to-str 'green some-obj)"
   {:style/indent 1}
@@ -543,7 +276,8 @@
 
 (defprotocol ^:private IFilteredStacktrace
   (filtered-stacktrace [this]
-    "Get the stack trace associated with E and return it as a vector with non-metabase frames filtered out."))
+    "Get the stack trace associated with E and return it as a vector with non-metabase frames after the last Metabase
+    frame filtered out."))
 
 ;; These next two functions are a workaround for this bug https://dev.clojure.org/jira/browse/CLJ-1790
 ;; When Throwable/Thread are type-hinted, they return an array of type StackTraceElement, this causes
@@ -566,59 +300,35 @@
   IFilteredStacktrace {:filtered-stacktrace (fn [this]
                                               (filtered-stacktrace (thread-get-stack-trace this)))})
 
+(defn- metabase-frame? [frame]
+  (re-find #"metabase" (str frame)))
+
 ;; StackTraceElement[] is what the `.getStackTrace` method for Thread and Throwable returns
 (extend (Class/forName "[Ljava.lang.StackTraceElement;")
-  IFilteredStacktrace {:filtered-stacktrace (fn [this]
-                                              (vec (for [frame this
-                                                         :let  [s (str frame)]
-                                                         :when (re-find #"metabase" s)]
-                                                     (s/replace s #"^metabase\." ""))))})
-
-(defn wrap-try-catch
-  "Returns a new function that wraps F in a `try-catch`. When an exception is caught, it is logged
-   with `log/error` and returns `nil`."
-  ([f]
-   (wrap-try-catch f nil))
-  ([f f-name]
-   (let [exception-message (if f-name
-                             (format "Caught exception in %s: " f-name)
-                             "Caught exception: ")]
-     (fn [& args]
-       (try
-         (apply f args)
-         (catch SQLException e
-           (log/error (format-color 'red "%s\n%s\n%s"
-                                    exception-message
-                                    (with-out-str (jdbc/print-sql-exception-chain e))
-                                    (pprint-to-str (filtered-stacktrace e)))))
-         (catch Throwable e
-           (log/error (format-color 'red "%s %s\n%s"
-                                    exception-message
-                                    (or (.getMessage e) e)
-                                    (pprint-to-str (filtered-stacktrace e))))))))))
-
-(defn try-apply
-  "Like `apply`, but wraps F inside a `try-catch` block and logs exceptions caught.
-   (This is actaully more flexible than `apply` -- the last argument doesn't have to be
-   a sequence:
-
-     (try-apply vector :a :b [:c :d]) -> [:a :b :c :d]
-     (apply vector :a :b [:c :d])     -> [:a :b :c :d]
-     (try-apply vector :a :b :c :d)   -> [:a :b :c :d]
-     (apply vector :a :b :c :d)       -> Not ok - :d is not a sequence
-
-   This allows us to use `try-apply` in more situations than we'd otherwise be able to."
-  [^clojure.lang.IFn f & args]
-  (apply (wrap-try-catch f) (concat (butlast args) (if (sequential? (last args))
-                                                     (last args)
-                                                     [(last args)]))))
+  IFilteredStacktrace
+  {:filtered-stacktrace
+   (fn [this]
+     ;; keep all the frames before the last Metabase frame, but then filter out any other non-Metabase frames after
+     ;; that
+     (let [[frames-after-last-mb other-frames]     (split-with (complement metabase-frame?)
+                                                               (map str (seq this)))
+           [last-mb-frame & frames-before-last-mb] (map #(s/replace % #"^metabase\." "")
+                                                        (filter metabase-frame? other-frames))]
+       (concat
+        frames-after-last-mb
+        ;; add a little arrow to the frame so it stands out more
+        (cons (some->> last-mb-frame (str "--> "))
+              frames-before-last-mb))))})
 
 (defn deref-with-timeout
-  "Call `deref` on a FUTURE and throw an exception if it takes more than TIMEOUT-MS."
-  [futur timeout-ms]
-  (let [result (deref futur timeout-ms ::timeout)]
+  "Call `deref` on a something derefable (e.g. a future or promise), and throw an exception if it takes more than
+  `timeout-ms`. If `ref` is a future it will attempt to cancel it as well."
+  [reff timeout-ms]
+  (let [result (deref reff timeout-ms ::timeout)]
     (when (= result ::timeout)
-      (throw (Exception. (format "Timed out after %d milliseconds." timeout-ms))))
+      (when (instance? java.util.concurrent.Future reff)
+        (future-cancel reff))
+      (throw (TimeoutException. (str (tru "Timed out after {0} milliseconds." timeout-ms)))))
     result))
 
 (defmacro with-timeout
@@ -634,7 +344,7 @@
   {:pre [(integer? decimal-place) (number? number)]}
   (double (.setScale (bigdec number) decimal-place BigDecimal/ROUND_HALF_UP)))
 
-(defn drop-first-arg
+(defn ^:deprecated drop-first-arg
   "Returns a new fn that drops its first arg and applies the rest to the original.
    Useful for creating `extend` method maps when you don't care about the `this` param. :flushed:
 
@@ -682,7 +392,7 @@
      "")))
 
 
-(def ^:private ^:const slugify-valid-chars
+(def ^:private slugify-valid-chars
   "Valid *ASCII* characters for URL slugs generated by `slugify`."
   #{\a \b \c \d \e \f \g \h \i \j \k \l \m \n \o \p \q \r \s \t \u \v \w \x \y \z
     \0 \1 \2 \3 \4 \5 \6 \7 \8 \9
@@ -740,8 +450,7 @@
      (key-by :id [{:id 1, :name :a} {:id 2, :name :b}]) -> {1 {:id 1, :name :a}, 2 {:id 2, :name :b}}"
   {:style/indent 1}
   [f coll]
-  (into {} (for [item coll]
-             {(f item) item})))
+  (into {} (map (juxt f identity)) coll))
 
 (defn keyword->qualified-name
   "Return keyword K as a string, including its namespace, if any (unlike `name`).
@@ -751,27 +460,30 @@
   (when k
     (s/replace (str k) #"^:" "")))
 
-(defn get-id
-  "Return the value of `:id` if OBJECT-OR-ID is a map, or otherwise return OBJECT-OR-ID as-is if it is an integer.
-   This is guaranteed to return an integer ID; it will throw an Exception if it cannot find one.
-   This is provided as a convenience to allow model-layer functions to easily accept either an object or raw ID."
-  ;; TODO - lots of functions can be rewritten to use this, which would make them more flexible
+(defn id
+  "If passed an integer ID, returns it. If passed a map containing an `:id` key, returns the value if it is an integer.
+  Otherwise returns `nil`.
+
+  Provided as a convenience to allow model-layer functions to easily accept either an object or raw ID. Use this in
+  cases where the ID/object is allowed to be `nil`. Use `get-id` below in cases where you would also like to guarantee
+  it is non-`nil`."
   ^Integer [object-or-id]
   (cond
     (map? object-or-id)     (recur (:id object-or-id))
-    (integer? object-or-id) object-or-id
-    :else                   (throw (Exception. (str "Not something with an ID: " object-or-id)))))
+    (integer? object-or-id) object-or-id))
 
-(defmacro profile
-  "Like `clojure.core/time`, but lets you specify a MESSAGE that gets printed with the total time,
-   and formats the time nicely using `format-nanoseconds`."
-  {:style/indent 1}
-  ([form]
-   `(profile ~(str form) ~form))
-  ([message & body]
-   `(let [start-time# (System/nanoTime)]
-      (prog1 (do ~@body)
-        (println (format-color '~'green "%s took %s" ~message (format-nanoseconds (- (System/nanoTime) start-time#))))))))
+;; TODO - now that I think about this, I think this should be called `the-id` instead, because the idea is similar to
+;; `clojure.core/the-ns`
+(defn get-id
+  "If passed an integer ID, returns it. If passed a map containing an `:id` key, returns the value if it is an integer.
+  Otherwise, throws an Exception.
+
+  Provided as a convenience to allow model-layer functions to easily accept either an object or raw ID, and to assert
+  that you have a valid ID."
+  ;; TODO - lots of functions can be rewritten to use this, which would make them more flexible
+  ^Integer [object-or-id]
+  (or (id object-or-id)
+      (throw (Exception. (str (tru "Not something with an ID: {0}" object-or-id))))))
 
 (def metabase-namespace-symbols
   "Delay to a vector of symbols of all Metabase namespaces, excluding test namespaces.
@@ -786,7 +498,7 @@
                                  (not (.contains (name ns-symb) "test")))]
                 ns-symb))))
 
-(def ^:const ^java.util.regex.Pattern uuid-regex
+(def ^java.util.regex.Pattern uuid-regex
   "A regular expression for matching canonical string representations of UUIDs."
   #"[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}")
 
@@ -810,16 +522,25 @@
                   v
                   (select-nested-keys v nested-keys))})))
 
-(defn base-64-string?
-  "Is S a Base-64 encoded string?"
+(defn base64-string?
+  "Is `s` a Base-64 encoded string?"
   ^Boolean [s]
   (boolean (when (string? s)
              (re-find #"^[0-9A-Za-z/+]+=*$" s))))
 
-(defn safe-inc
+(defn decode-base64
+  "Decodes a Base64 string to a UTF-8 string"
+  [input]
+  (new java.lang.String (javax.xml.bind.DatatypeConverter/parseBase64Binary input) "UTF-8"))
+
+(defn encode-base64
+  "Encodes a string to a Base64 string"
+  [^String input]
+  (javax.xml.bind.DatatypeConverter/printBase64Binary (.getBytes input "UTF-8")))
+
+(def ^{:arglists '([n])} safe-inc
   "Increment N if it is non-`nil`, otherwise return `1` (e.g. as if incrementing `0`)."
-  [n]
-  (if n (inc n) 1))
+  (fnil inc 0))
 
 (defn occurances-of-substring
   "Return the number of times SUBSTR occurs in string S."
@@ -841,17 +562,17 @@
              {k (get m k)})))
 
 (defn select-keys-when
-  "Returns a map that only contains keys that are either `:present` or `:non-nil`.
-   Combines behavior of `select-keys` and `select-non-nil-keys`.
-   This is useful for API endpoints that update a model, which often have complex rules about what gets updated
-   (some keys are updated if `nil`, others only if non-nil).
+  "Returns a map that only contains keys that are either `:present` or `:non-nil`. Combines behavior of `select-keys`
+  and `select-non-nil-keys`. This is useful for API endpoints that update a model, which often have complex rules
+  about what gets updated (some keys are updated if `nil`, others only if non-nil).
 
      (select-keys-when {:a 100, :b nil, :d 200, :e nil}
        :present #{:a :b :c}
        :non-nil #{:d :e :f})
      ;; -> {:a 100, :b nil, :d 200}"
   {:style/indent 1}
-  [m & {:keys [present non-nil]}]
+  [m & {:keys [present non-nil], :as options}]
+  {:pre [(every? #{:present :non-nil} (keys options))]}
   (merge (select-keys m present)
          (select-non-nil-keys m non-nil)))
 
@@ -864,38 +585,128 @@
                          (Math/log 10))))))
 
 (defn update-when
-  "Like clojure.core/update but does not create a new key if it does not exist."
+  "Like clojure.core/update but does not create a new key if it does not exist.
+   Useful when you don't want to create cruft."
   [m k f & args]
   (if (contains? m k)
     (apply update m k f args)
     m))
 
-(def ^:private date-time-with-millis-no-t
-  "This primary use for this formatter is for Dates formatted by the
-  built-in SQLite functions"
-  (->DateTimeFormatter "yyyy-MM-dd HH:mm:ss.SSS"))
+(defn update-in-when
+  "Like clojure.core/update-in but does not create new keys if they do not exist.
+   Useful when you don't want to create cruft."
+  [m k f & args]
+  (if (not= ::not-found (get-in m k ::not-found))
+    (apply update-in m k f args)
+    m))
 
-(def ^:private ordered-date-parsers
-  "When using clj-time.format/parse without a formatter, it tries all default formatters, but not ordered by how
-  likely the date formatters will succeed. This leads to very slow parsing as many attempts fail before the right one
-  is found. Using this retains that flexibility but improves performance by trying the most likely ones first"
-  (let [most-likely-default-formatters [:mysql :date-hour-minute-second :date-time :date
-                                        :basic-date-time :basic-date-time-no-ms
-                                        :date-time :date-time-no-ms]]
-    (concat (map time/formatters most-likely-default-formatters)
-            [date-time-with-millis-no-t]
-            (vals (apply dissoc time/formatters most-likely-default-formatters)))))
+(defn index-of
+  "Return index of the first element in `coll` for which `pred` reutrns true."
+  [pred coll]
+  (first (keep-indexed (fn [i x]
+                         (when (pred x) i))
+                       coll)))
 
-(defn str->date-time
-  "Like clj-time.format/parse but uses an ordered list of parsers to be faster. Returns the parsed date or nil if it
-  was unable to be parsed."
-  ([^String date-str]
-   (str->date-time date-str nil))
-  ([^String date-str ^TimeZone tz]
-   (let [dtz (some-> tz .getID t/time-zone-for-id)]
-     (first
-      (for [formatter ordered-date-parsers
-            :let [formatter-with-tz (time/with-zone formatter dtz)
-                  parsed-date (ignore-exceptions (time/parse formatter-with-tz date-str))]
-            :when parsed-date]
-        parsed-date)))))
+
+(defn is-java-9-or-higher?
+  "Are we running on Java 9 or above?"
+  ([]
+   (is-java-9-or-higher? (System/getProperty "java.version")))
+  ([java-version-str]
+   (when-let [[_ java-major-version-str] (re-matches #"^(?:1\.)?(\d+).*$" java-version-str)]
+     (>= (Integer/parseInt java-major-version-str) 9))))
+
+(defn hexadecimal-string?
+  "Returns truthy if `new-value` is a hexadecimal-string"
+  [new-value]
+  (and (string? new-value)
+       (re-matches #"[0-9a-f]{64}" new-value)))
+
+(defn snake-key
+  "Convert a keyword or string `k` from `lisp-case` to `snake-case`."
+  [k]
+  (if (keyword? k)
+    (keyword (snake-key (name k)))
+    (s/replace k #"-" "_")))
+
+(defn recursive-map-keys
+  "Recursively replace the keys in a map with the value of `(f key)`."
+  [f m]
+  (walk/postwalk
+   #(if (map? %)
+      (m/map-keys f %)
+      %)
+   m))
+
+(defn snake-keys
+  "Convert the keys in a map from `lisp-case` to `snake-case`."
+  [m]
+  (recursive-map-keys snake-key m))
+
+(defn one-or-many
+  "Wraps a single element in a sequence; returns sequences as-is. In lots of situations we'd like to accept either a
+  single value or a collection of values as an argument to a function, and then loop over them; rather than repeat
+  logic to check whether something is a collection and wrap if not everywhere, this utility function is provided for
+  your convenience.
+
+    (u/one-or-many 1)     ; -> [1]
+    (u/one-or-many [1 2]) ; -> [1 2]"
+  [arg]
+  (if ((some-fn sequential? set?) arg)
+    arg
+    [arg]))
+
+(defmacro varargs
+  "Make a properly-tagged Java interop varargs argument.
+
+    (u/varargs String)
+    (u/varargs String [\"A\" \"B\"])"
+  {:style/indent 1}
+  [klass & [objects]]
+  (vary-meta `(into-array ~klass ~objects)
+             assoc :tag (format "[L%s;" (.getCanonicalName ^Class (ns-resolve *ns* klass)))))
+
+(def ^:private do-with-us-locale-lock (Object.))
+
+(defn do-with-us-locale
+  "Implementation for `with-us-locale` macro; see below."
+  [f]
+  ;; Since I'm 99% sure default Locale isn't thread-local we better put a lock in place here so we don't end up with
+  ;; the following race condition:
+  ;;
+  ;; Thread 1 ....*.............................*........................*...........*
+  ;;              ^getDefault() -> Turkish      ^setDefault(US)          ^(f)        ^setDefault(Turkish)
+  ;; Thread 2 ....................................*....................*................*......*
+  ;;                                              ^getDefault() -> US  ^setDefault(US)  ^(f)   ^setDefault(US)
+  (locking do-with-us-locale-lock
+    (let [original-locale (Locale/getDefault)]
+      (try
+        (Locale/setDefault Locale/US)
+        (f)
+        (finally
+          (Locale/setDefault original-locale))))))
+
+(defmacro with-us-locale
+  "Execute `body` with the default system locale temporarily set to `locale`. Why would you want to do this? Tons of
+  code relies on `String/toUpperCase` which converts a string to uppercase based on the default locale. Normally, this
+  does what you'd expect, but when the default locale is Turkish, all hell breaks loose:
+
+    ;; Locale is Turkish / -Duser.language=tr
+    (.toUpperCase \"filename\") ;; -> \"FİLENAME\"
+
+  Rather than submit PRs to every library in the world to use `(.toUpperCase <str> Locale/US)`, it's simpler just to
+  temporarily bind the default Locale to something predicatable (i.e. US English) when doing something important that
+  tends to break like running Liquibase migrations.)
+
+  Note that because `Locale/setDefault` and `Locale/getDefault` aren't thread-local (as far as I know) I've had to put
+  a lock in place to prevent race conditions where threads simulataneously attempt to fetch and change the default
+  Locale. Thus this macro should be used sparingly, and only in places that are already single-threaded (such as the
+  launch code that runs Liquibase).
+
+  DO NOT use this macro in API endpoints or other places that are multithreaded or performance will be negatively
+  impacted. (You shouldn't have a good reason for using this there anyway. Rewrite your code to pass `Locale/US` when
+  you call `.toUpperCase` or `str/upper-case`. Only use this macro if the calls in question are part of a 3rd-party
+  library.)"
+  {:style/indent 0}
+  [& body]
+  `(do-with-us-locale (fn [] ~@body)))

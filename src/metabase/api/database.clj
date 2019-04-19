@@ -13,20 +13,23 @@
             [metabase.api
              [common :as api]
              [table :as table-api]]
+            [metabase.driver.util :as driver.u]
+            [metabase.mbql.util :as mbql.u]
             [metabase.models
              [card :refer [Card]]
              [database :as database :refer [Database protected-password]]
-             [field :refer [Field]]
+             [field :refer [Field readable-fields-only]]
              [field-values :refer [FieldValues]]
              [interface :as mi]
              [permissions :as perms]
              [table :refer [Table]]]
-            [metabase.query-processor.util :as qputil]
             [metabase.sync
+             [analyze :as analyze]
              [field-values :as sync-field-values]
              [sync-metadata :as sync-metadata]]
             [metabase.util
              [cron :as cron-util]
+             [i18n :refer [tru]]
              [schema :as su]]
             [schema.core :as s]
             [toucan
@@ -36,8 +39,11 @@
 
 (def DBEngineString
   "Schema for a valid database engine name, e.g. `h2` or `postgres`."
-  (su/with-api-error-message (s/constrained su/NonBlankString driver/is-engine? "Valid database engine")
-    "value must be a valid database engine."))
+  (su/with-api-error-message (s/constrained
+                              su/NonBlankString
+                              #(u/ignore-exceptions (driver/the-driver %))
+                              "Valid database engine")
+    (tru "value must be a valid database engine.")))
 
 
 ;;; ----------------------------------------------- GET /api/database ------------------------------------------------
@@ -50,22 +56,26 @@
     (for [db dbs]
       (assoc db :tables (get db-id->tables (:id db) [])))))
 
-(defn- add-native-perms-info
+(s/defn ^:private add-native-perms-info :- [{:native_permissions (s/enum :write :none), s/Keyword s/Any}]
   "For each database in DBS add a `:native_permissions` field describing the current user's permissions for running
-   native (e.g. SQL) queries. Will be one of `:write`, `:read`, or `:none`."
-  [dbs]
+  native (e.g. SQL) queries. Will be either `:write` or `:none`. `:write` means you can run ad-hoc native queries,
+  and save new Cards with native queries; `:none` means you can do neither.
+
+  For the curious: the use of `:write` and `:none` is mainly for legacy purposes, when we had data-access-based
+  permissions; there was a specific option where you could give a Perms Group permissions to run existing Cards with
+  native queries, but not to create new ones. With the advent of what is currently being called 'Space-Age
+  Permissions', all Cards' permissions are based on their parent Collection, removing the need for native read perms."
+  [dbs :- [su/Map]]
   (for [db dbs]
-    (let [user-has-perms? (fn [path-fn] (perms/set-has-full-permissions? @api/*current-user-permissions-set* (path-fn (u/get-id db))))]
-      (assoc db :native_permissions (cond
-                                      (user-has-perms? perms/native-readwrite-path) :write
-                                      (user-has-perms? perms/native-read-path)      :read
-                                      :else                                         :none)))))
+    (assoc db :native_permissions (if (perms/set-has-full-permissions? @api/*current-user-permissions-set*
+                                        (perms/adhoc-native-query-path (u/get-id db)))
+                                    :write
+                                    :none))))
 
 (defn- card-database-supports-nested-queries? [{{database-id :database} :dataset_query, :as card}]
   (when database-id
-    (when-let [driver (driver/database-id->driver database-id)]
-      (and (driver/driver-supports? driver :nested-queries)
-           (mi/can-read? card)))))
+    (when-let [driver (driver.u/database->driver database-id)]
+      (driver/supports? driver :nested-queries))))
 
 (defn- card-has-ambiguous-columns?
   "We know a card has ambiguous columns if any of the columns that come back end in `_2` (etc.) because that's what
@@ -91,22 +101,16 @@
    use queries with those aggregations as source queries. This function determines whether CARD is using one
    of those queries so we can filter it out in Clojure-land."
   [{{{aggregations :aggregation} :query} :dataset_query}]
-  (when (seq aggregations)
-    (some (fn [[ag-type]]
-            (contains? #{:cum-count :cum-sum} (qputil/normalize-token ag-type)))
-          ;; if we were passed in old-style [ag] instead of [[ag1], [ag2]] convert to new-style so we can iterate
-          ;; over list of aggregations
-          (if-not (sequential? (first aggregations))
-            [aggregations]
-            aggregations))))
+  (mbql.u/match aggregations #{:cum-count :cum-sum}))
 
 (defn- source-query-cards
   "Fetch the Cards that can be used as source queries (e.g. presented as virtual tables)."
   []
   (as-> (db/select [Card :name :description :database_id :dataset_query :id :collection_id :result_metadata]
-          :result_metadata [:not= nil]
+          :result_metadata [:not= nil] :archived false
           {:order-by [[:%lower.name :asc]]}) <>
     (filter card-database-supports-nested-queries? <>)
+    (filter mi/can-read? <>)
     (remove card-uses-unnestable-aggregation? <>)
     (remove card-has-ambiguous-columns? <>)
     (hydrate <> :collection)))
@@ -136,13 +140,15 @@
     dbs))
 
 (defn- dbs-list [include-tables? include-cards?]
-  (when-let [dbs (seq (filter mi/can-read? (db/select Database {:order-by [:%lower.name]})))]
+  (when-let [dbs (seq (filter mi/can-read? (db/select Database {:order-by [:%lower.name :%lower.engine]})))]
     (cond-> (add-native-perms-info dbs)
       include-tables? add-tables
       include-cards?  add-virtual-tables-for-saved-cards)))
 
 (api/defendpoint GET "/"
-  "Fetch all `Databases`."
+  "Fetch all `Databases`. `include_tables` means we should hydrate the Tables belonging to each DB. `include_cards` here
+  means we should also include virtual Table entries for saved Questions, e.g. so we can easily use them as source
+  Tables in queries. Default for both is `false`."
   [include_tables include_cards]
   {include_tables (s/maybe su/BooleanString)
    include_cards  (s/maybe su/BooleanString)}
@@ -150,7 +156,7 @@
       []))
 
 
-;;; ------------------------------------------------------------ GET /api/database/:id ------------------------------------------------------------
+;;; --------------------------------------------- GET /api/database/:id ----------------------------------------------
 
 (def ExpandedSchedulesMap
   "Schema for the `:schedules` key we add to the response containing 'expanded' versions of the CRON schedules.
@@ -167,7 +173,8 @@
    :metadata_sync      (cron-util/cron-string->schedule-map (:metadata_sync_schedule db))})
 
 (defn- add-expanded-schedules
-  "Add 'expanded' versions of the cron schedules strings for DB in a format that is appropriate for frontend consumption."
+  "Add 'expanded' versions of the cron schedules strings for DB in a format that is appropriate for frontend
+  consumption."
   [db]
   (assoc db :schedules (expanded-schedules db)))
 
@@ -177,7 +184,7 @@
   (add-expanded-schedules (api/read-check Database id)))
 
 
-;;; ------------------------------------------------------------ GET /api/database/:id/metadata ------------------------------------------------------------
+;;; ----------------------------------------- GET /api/database/:id/metadata -----------------------------------------
 
 ;; Since the normal `:id` param in the normal version of the endpoint will never match with negative numbers
 ;; we'll create another endpoint to specifically match the ID of the 'virtual' database. The `defendpoint` macro
@@ -192,7 +199,7 @@
 
 (defn- db-metadata [id]
   (-> (api/read-check Database id)
-      (hydrate [:tables [:fields :target :values] :segments :metrics])
+      (hydrate [:tables [:fields [:target :has_field_values] :has_field_values] :segments :metrics])
       (update :tables (fn [tables]
                         (for [table tables
                               :when (mi/can-read? table)]
@@ -207,7 +214,7 @@
   (db-metadata id))
 
 
-;;; ------------------------------------------------------------ GET /api/database/:id/autocomplete_suggestions ------------------------------------------------------------
+;;; --------------------------------- GET /api/database/:id/autocomplete_suggestions ---------------------------------
 
 (defn- autocomplete-tables [db-id prefix]
   (db/select [Table :id :db_id :schema :name]
@@ -239,7 +246,7 @@
 
 (defn- autocomplete-suggestions [db-id prefix]
   (let [tables (filter mi/can-read? (autocomplete-tables db-id prefix))
-        fields (filter mi/can-read? (autocomplete-fields db-id prefix))]
+        fields (readable-fields-only (autocomplete-fields db-id prefix))]
     (autocomplete-results tables fields)))
 
 (api/defendpoint GET "/:id/autocomplete_suggestions"
@@ -284,7 +291,7 @@
   [id]
   (api/read-check Database id)
   (sort-by (comp str/lower-case :name :table) (filter mi/can-read? (-> (database/pk-fields {:id id})
-                                                                         (hydrate :table)))))
+                                                                       (hydrate :table)))))
 
 
 ;;; ----------------------------------------------- POST /api/database -----------------------------------------------
@@ -295,30 +302,41 @@
    field    m
    :message m})
 
-(defn- test-database-connection
+(defn test-database-connection
   "Try out the connection details for a database and useful error message if connection fails, returns `nil` if
    connection succeeds."
-  [engine {:keys [host port] :as details}]
+  [engine {:keys [host port] :as details}, & {:keys [invalid-response-handler]
+                                              :or   {invalid-response-handler invalid-connection-response}}]
   ;; This test is disabled for testing so we can save invalid databases, I guess (?) Not sure why this is this way :/
   (when-not config/is-test?
     (let [engine  (keyword engine)
           details (assoc details :engine engine)]
       (try
         (cond
-          (driver/can-connect-with-details? engine details :rethrow-exceptions) nil
-          (and host port (u/host-port-up? host port))                           (invalid-connection-response :dbname (format "Connection to '%s:%d' successful, but could not connect to DB." host port))
-          (and host (u/host-up? host))                                          (invalid-connection-response :port   (format "Connection to '%s' successful, but port %d is invalid." port))
-          host                                                                  (invalid-connection-response :host   (format "'%s' is not reachable" host))
-          :else                                                                 (invalid-connection-response :db     "Unable to connect to database."))
+          (driver.u/can-connect-with-details? engine details :throw-exceptions)
+          nil
+
+          (and host port (u/host-port-up? host port))
+          (invalid-response-handler :dbname (format "Connection to '%s:%d' successful, but could not connect to DB."
+                                                    host port))
+
+          (and host (u/host-up? host))
+          (invalid-response-handler :port (format "Connection to '%s' successful, but port %d is invalid." port))
+
+          host
+          (invalid-response-handler :host (format "'%s' is not reachable" host))
+
+          :else
+          (invalid-response-handler :db "Unable to connect to database."))
         (catch Throwable e
-          (invalid-connection-response :dbname (.getMessage e)))))))
+          (invalid-response-handler :dbname (.getMessage e)))))))
 
 ;; TODO - Just make `:ssl` a `feature`
 (defn- supports-ssl?
   "Does the given `engine` have an `:ssl` setting?"
-  [engine]
-  {:pre [(driver/is-engine? engine)]}
-  (let [driver-props (set (for [field (driver/details-fields (driver/engine->driver engine))]
+  [driver]
+  {:pre [(driver/available? driver)]}
+  (let [driver-props (set (for [field (driver/connection-properties driver)]
                             (:name field)))]
     (contains? driver-props "ssl")))
 
@@ -328,7 +346,7 @@
    the details used to successfully connect.  Otherwise returns a map with the connection error message. (This map
    will also contain the key `:valid` = `false`, which you can use to distinguish an error from valid details.)"
   [engine :- DBEngineString, details :- su/Map]
-  (let [details (if (supports-ssl? engine)
+  (let [details (if (supports-ssl? (keyword engine))
                   (assoc details :ssl true)
                   details)]
     ;; this loop tries connecting over ssl and non-ssl to establish a connection
@@ -490,7 +508,8 @@
   ;; just wrap this in a future so it happens async
   (api/let-404 [db (Database id)]
     (future
-      (sync-metadata/sync-db-metadata! db)))
+      (sync-metadata/sync-db-metadata! db)
+      (analyze/analyze-db! db)))
   {:status :ok})
 
 ;; TODO - do we also want an endpoint to manually trigger analysis. Or separate ones for classification/fingerprinting?
@@ -528,6 +547,37 @@
   (api/check-superuser)
   (delete-all-field-values-for-database! id)
   {:status :ok})
+
+
+;;; ------------------------------------------ GET /api/database/:id/schemas -----------------------------------------
+
+(defn- can-read-schema?
+  "Does the current user have permissions to know the schema with `schema-name` exists? (Do they have permissions to see
+  at least some of its tables?)"
+  [database-id schema-name]
+  (perms/set-has-partial-permissions? @api/*current-user-permissions-set*
+    (perms/object-path database-id schema-name)))
+
+(api/defendpoint GET "/:id/schemas"
+  "Returns a list of all the schemas found for the database `id`"
+  [id]
+  (api/read-check Database id)
+  (->> (db/select-field :schema Table :db_id id)
+       (filter (partial can-read-schema? id))
+       sort))
+
+
+;;; ------------------------------------- GET /api/database/:id/schema/:schema ---------------------------------------
+
+(api/defendpoint GET "/:id/schema/:schema"
+  "Returns a list of tables for the given database `id` and `schema`"
+  [id schema]
+  (api/read-check Database id)
+  (api/check-403 (can-read-schema? id schema))
+  (->> (db/select Table :db_id id, :schema schema, :active true, {:order-by [[:name :asc]]})
+       (filter mi/can-read?)
+       seq
+       api/check-404))
 
 
 (api/define-routes)
