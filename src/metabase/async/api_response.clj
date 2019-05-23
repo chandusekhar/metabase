@@ -186,8 +186,10 @@
     (log/debug (u/format-color 'green (trs "starting streaming response")))
     (write-chan-vals-to-writer! (async-keepalive-channel chan) (io/writer output-stream))))
 
+;; `defendpoint-async` responses
 (extend-protocol Sendable
   ManyToManyChannel
   (send* [input-chan _ respond _]
-    (respond (assoc (response/response input-chan)
-               :content-type "applicaton/json; charset=utf-8"))))
+    (respond
+     (assoc (response/response input-chan)
+       :content-type "applicaton/json; charset=utf-8"))))

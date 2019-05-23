@@ -48,7 +48,6 @@ export default class PreferencesStep extends Component {
       stepNumber,
       setActiveStep,
     } = this.props;
-    const { tag } = MetabaseSettings.get("version");
 
     let stepText = t`Usage data preferences`;
     if (setupComplete) {
@@ -76,11 +75,7 @@ export default class PreferencesStep extends Component {
               {t`In order to help us improve Metabase, we'd like to collect certain data about usage through Google Analytics.`}{" "}
               <a
                 className="link"
-                href={
-                  "https://metabase.com/docs/" +
-                  tag +
-                  "/information-collection.html"
-                }
+                href={MetabaseSettings.docsUrl("information-collection")}
                 target="_blank"
               >{t`Here's a full list of everything we track and why.`}</a>
             </div>
@@ -106,8 +101,7 @@ export default class PreferencesStep extends Component {
                     <span style={{ fontWeight: "bold" }}>{t`never`}</span>
                   )} collects anything about your data or question results.`}</li>
                   <li>{t`All collection is completely anonymous.`}</li>
-                  <li
-                  >{t`Collection can be turned off at any point in your admin settings.`}</li>
+                  <li>{t`Collection can be turned off at any point in your admin settings.`}</li>
                 </ul>
               </div>
             ) : null}

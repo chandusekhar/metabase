@@ -18,6 +18,8 @@ import * as metadataActions from "metabase/redux/metadata";
 import * as actions from "metabase/reference/reference";
 import { clearRequestState } from "metabase/redux/requests";
 
+import MetabaseSettings from "metabase/lib/settings";
+
 import Dashboards from "metabase/entities/dashboards";
 
 import { updateSetting } from "metabase/admin/settings/settings";
@@ -123,7 +125,10 @@ const mapDispatchToProps = {
   ...actions,
 };
 
-@connect(mapStateToProps, mapDispatchToProps)
+@connect(
+  mapStateToProps,
+  mapDispatchToProps,
+)
 @reduxForm({
   form: "guide",
   fields: [
@@ -285,7 +290,10 @@ export default class GettingStartedGuideEditForm extends Component {
                 collapsedTitle={t`Do you have any commonly referenced metrics?`}
                 collapsedIcon="ruler"
                 linkMessage={t`Learn how to define a metric`}
-                link="https://metabase.com/docs/latest/administration-guide/07-segments-and-metrics.html#creating-a-metric"
+                link={MetabaseSettings.docsUrl(
+                  "administration-guide/07-segments-and-metrics",
+                  "creating-a-metric",
+                )}
                 expand={() =>
                   important_metrics.addField({
                     id: null,
@@ -357,7 +365,10 @@ export default class GettingStartedGuideEditForm extends Component {
                 collapsedTitle={t`Do you have any commonly referenced segments or tables?`}
                 collapsedIcon="table2"
                 linkMessage={t`Learn how to create a segment`}
-                link="https://metabase.com/docs/latest/administration-guide/07-segments-and-metrics.html#creating-a-segment"
+                link={MetabaseSettings.docsUrl(
+                  "administration-guide/07-segments-and-metrics",
+                  "creating-a-segment",
+                )}
                 expand={() =>
                   important_segments_and_tables.addField({
                     id: null,
