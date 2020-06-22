@@ -3,6 +3,8 @@ export dashboards from "./dashboards";
 export pulses from "./pulses";
 export questions from "./questions";
 
+export revisions from "./revisions";
+
 export databases from "./databases";
 export schemas from "./schemas";
 export tables from "./tables";
@@ -15,3 +17,4 @@ export users from "./users";
 export groups from "./groups";
 
 export search from "./search";
+export snippets from "./snippets";

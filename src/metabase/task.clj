@@ -61,14 +61,11 @@
 (defn- find-and-load-task-namespaces!
   "Search Classpath for namespaces that start with `metabase.tasks.`, then `require` them so initialization can happen."
   []
-  ;; make sure current thread is using canonical MB classloader
-  (classloader/the-classloader)
-  ;; first, load all the task namespaces
-  (doseq [ns-symb @u/metabase-namespace-symbols
+  (doseq [ns-symb u/metabase-namespace-symbols
           :when   (.startsWith (name ns-symb) "metabase.task.")]
     (try
       (log/debug (trs "Loading tasks namespace:") (u/format-color 'blue ns-symb))
-      (require ns-symb)
+      (classloader/require ns-symb)
       (catch Throwable e
         (log/error e (trs "Error loading tasks namespace {0}" ns-symb))))))
 
@@ -96,7 +93,15 @@
   (getConnection [_]
     ;; get a connection from our application DB connection pool. Quartz will close it (i.e., return it to the pool)
     ;; when it's done
-    (jdbc/get-connection (db/connection)))
+    ;;
+    ;; very important! Fetch a new connection from the connection pool rather than using currently bound Connection if
+    ;; one already exists -- because Quartz will close this connection when done, we don't want to screw up the
+    ;; calling block
+    ;;
+    ;; in a perfect world we could just check whether we're creating a new Connection or not, and if using an existing
+    ;; Connection, wrap it in a delegating proxy wrapper that makes `.close()` a no-op but forwards all other methods.
+    ;; Now that would be a useful macro!
+    (some-> @@#'db/default-db-connection jdbc/get-connection))
   (shutdown [_]))
 
 (when-not *compile-files*

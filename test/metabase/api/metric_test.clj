@@ -35,7 +35,9 @@
    :definition              nil})
 
 (defn- user-details [user]
-  (select-keys user [:id :email :date_joined :first_name :last_name :last_login :is_superuser :is_qbnewb :common_name]))
+  (select-keys
+   user
+   [:id :email :date_joined :first_name :last_name :last_login :is_superuser :is_qbnewb :common_name :locale]))
 
 (defn- metric-response [{:keys [created_at updated_at], :as metric}]
   (-> (into {} metric)
@@ -139,7 +141,7 @@
           :creator_id (user->id :rasta)
           :creator    (user-details (fetch-user :rasta))
           :definition {:database 2
-                       :query    {:filter ["not" "the toucans you're looking for"]}}})
+                       :query    {:filter ["not" ["=" "field" "the toucans you're looking for"]]}}})
   (tt/with-temp* [Database [{database-id :id}]
                   Table    [{table-id :id} {:db_id database-id}]
                   Metric   [{:keys [id]} {:table_id table-id}]]
@@ -155,7 +157,7 @@
        :table_id                456
        :revision_message        "I got me some revisions"
        :definition              {:database 2
-                                 :query    {:filter ["not" "the toucans you're looking for"]}}}))))
+                                 :query    {:filter ["not" ["=" "field" "the toucans you're looking for"]]}}}))))
 
 ;; Can we archive a Metric with the PUT endpoint?
 

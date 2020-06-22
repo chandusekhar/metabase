@@ -109,15 +109,17 @@
 }
 
 /* text weight */
-.text-light {
-  font-weight: 300;
-}
+/* NOTE: .text-light removed since it conflicted with text-light in colors.css */
 .text-normal {
   font-weight: 400;
 }
 .text-bold,
 :local(.text-bold) {
   font-weight: 700;
+}
+
+.text-heavy {
+  font-weight: 900;
 }
 
 /* text style */
@@ -169,6 +171,12 @@
   text-overflow: ellipsis;
 }
 
+.text-wrap {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  word-wrap: anywhere;
+}
+
 .text-nowrap {
   white-space: nowrap;
 }
@@ -179,6 +187,12 @@
   background-color: var(--color-bg-medium);
   border-radius: 2px;
   padding: 0.2em 0.4em;
+  line-height: 1.4em;
+  white-space: pre-wrap;
+}
+.text-code-plain {
+  font-family: monospace;
+  color: var(--color-text-dark);
   line-height: 1.4em;
   white-space: pre-wrap;
 }
